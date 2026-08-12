@@ -1,0 +1,11 @@
+Flask==3.0.3
+Flask-CORS==4.0.0
+requests==2.32.3
+gunicorn==22.0.0
+pywidevine==1.8.0
+pyyaml==6.0.2
+pyasn1==0.6.0
+pyasn1-modules==0.4.0
+rsa==4.9
+cachetools==5.5.0
+protobuf==4.25.4
