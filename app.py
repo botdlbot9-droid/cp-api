@@ -48,11 +48,36 @@ def find_wvd_file():
     raise FileNotFoundError("No .wvd file found in WVDs/ folder")
 
 # ============================================================
+#  EXTRACT CONTENT ID
+# ============================================================
+def extract_content_id(url):
+    """Extract contentId from various ClassPlus URL formats"""
+    patterns = [
+        r'/lc/([^/]+)/',           # Akamai pattern: /lc/9k7vk-8822155n/
+        r'/gcs/\d+/lc/([^/]+)/',   # Full Akamai pattern
+        r'/content/([^/]+)/',      # Alternative pattern
+        r'/([^/]+)/\d+/hdntl=',    # Before hdntl
+        r'contentHashId=([^&]+)',  # Old L1 pattern
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+# ============================================================
 #  MAIN SIGN FUNCTION
 # ============================================================
 def sign_url(url, token):
     if not token:
         return {"error": "No token provided. Set CLASSPLUS_TOKEN environment variable."}
+
+    # Extract contentId
+    content_id = extract_content_id(url)
+    if not content_id:
+        # If no contentId found, try using the URL directly
+        logger.warning(f"Could not extract contentId from URL: {url[:80]}...")
+        return {"error": "Could not extract contentId from URL. Please provide a valid ClassPlus video link."}
 
     headers = {
         'accept': 'application/json, text/plain, */*',
@@ -73,42 +98,39 @@ def sign_url(url, token):
     }
 
     try:
-        # Extract contentId from URL
-        content_id = None
-        if 'akamai-cdn.classplusapp.com' in url:
-            match = re.search(r'/lc/([^/]+)/', url)
-            if match:
-                content_id = match.group(1)
-        elif 'contentHashId=' in url:
-            content_id = url.split('contentHashId=')[1].split('&')[0]
-
-        # Call ClassPlus API
-        if content_id:
-            resp = requests.get(
-                f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?contentId={content_id}&offlineDownload=false',
-                headers=headers, timeout=15
-            )
-        else:
-            resp = requests.get(
-                f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url}',
-                headers=headers, timeout=15
-            )
-
+        # Call ClassPlus API with contentId
+        api_params = {
+            'contentId': content_id,
+            'offlineDownload': 'false'
+        }
+        
+        logger.info(f"Calling ClassPlus API with contentId: {content_id}")
+        
+        resp = requests.get(
+            'https://api.classplusapp.com/cams/uploader/video/jw-signed-url',
+            params=api_params,
+            headers=headers,
+            timeout=15
+        )
+        
+        logger.info(f"ClassPlus API status: {resp.status_code}")
         data = resp.json()
-        logger.info(f"ClassPlus API response: {data.get('status', 'unknown')}")
+        logger.info(f"ClassPlus API response keys: {list(data.keys())}")
 
         # Non-DRM case
         if data.get('status') == 'ok' and data.get('url'):
-            return {"url": data['url']}
+            return {"url": data['url'], "content_id": content_id}
 
         # Token invalid
         if data.get('error') == 'Invalid token' or data.get('status') == 'failure':
-            return {"error": "Token expired or invalid"}
+            return {"error": "Token expired or invalid. Please update CLASSPLUS_TOKEN."}
 
         # DRM case
         drm_urls = data.get('drmUrls')
         if not drm_urls:
-            return {"error": "No DRM and no direct URL"}
+            # Log the full response for debugging
+            logger.error(f"Unexpected response: {data}")
+            return {"error": "No DRM and no direct URL", "raw_response": data}
 
         mpd_url = drm_urls.get('manifestUrl')
         lic_url = drm_urls.get('licenseUrl')
@@ -139,7 +161,7 @@ def sign_url(url, token):
             return {"error": "PSSH not found in MPD"}
 
         if not PYWIDEVINE_AVAILABLE:
-            return {"error": "Pywidevine not installed"}
+            return {"error": "Pywidevine not installed on server"}
 
         # Decrypt with Widevine
         try:
@@ -175,7 +197,11 @@ def sign_url(url, token):
                 return {"error": "No decryption keys extracted"}
 
             logger.info(f"✅ Extracted {len(keys)} keys")
-            return {"MPD": mpd_url, "KEYS": keys}
+            return {
+                "MPD": mpd_url,
+                "KEYS": keys,
+                "content_id": content_id
+            }
 
         except FileNotFoundError as e:
             return {"error": f"WVD file error: {str(e)}"}
@@ -203,8 +229,28 @@ def home():
 @app.route('/itsgolu', methods=['GET'])
 def itsgolu():
     url = request.args.get('url')
+    content_id = request.args.get('contentId')
+    
+    # If contentId is provided directly, use it
+    if content_id:
+        logger.info(f"Using direct contentId: {content_id}")
+        if not CLASSPLUS_TOKEN:
+            return jsonify({
+                "success": False,
+                "error": "CLASSPLUS_TOKEN not set. Please set environment variable."
+            }), 500
+        
+        # Build a fake URL to use sign_url
+        fake_url = f"https://akamai-cdn.classplusapp.com/lc/{content_id}/720/hdntl=placeholder/720p.m3u8"
+        result = sign_url(fake_url, CLASSPLUS_TOKEN)
+        
+        if "error" in result:
+            return jsonify({"success": False, "error": result["error"]}), 500
+        return jsonify({"success": True, **result})
+    
+    # Otherwise use URL
     if not url:
-        return jsonify({"error": "url parameter required"}), 400
+        return jsonify({"error": "url or contentId parameter required"}), 400
 
     if not CLASSPLUS_TOKEN:
         return jsonify({
@@ -212,7 +258,7 @@ def itsgolu():
             "error": "CLASSPLUS_TOKEN not set. Please set environment variable."
         }), 500
 
-    logger.info(f"Processing: {url[:80]}...")
+    logger.info(f"Processing URL: {url[:80]}...")
     result = sign_url(url, CLASSPLUS_TOKEN)
 
     if "error" in result:
@@ -222,10 +268,15 @@ def itsgolu():
 
 @app.route('/health', methods=['GET'])
 def health():
+    wvd_status = "✅ Found" if glob.glob('WVDs/*.wvd') else "❌ Not found"
+    token_status = "✅ Set" if CLASSPLUS_TOKEN else "❌ Not set"
+    
     return jsonify({
         "status": "healthy",
         "pywidevine": "✅ Available" if PYWIDEVINE_AVAILABLE else "❌ Not installed",
-        "wvd": "✅ Found" if glob.glob('WVDs/*.wvd') else "❌ Not found"
+        "wvd_file": wvd_status,
+        "token": token_status,
+        "device_id": CURRENT_DEVICE_ID
     })
 
 # ============================================================
